@@ -1,0 +1,231 @@
+"""Long-form Whisper decoding must not condition on the previous window.
+
+faster-whisper and MLX Whisper feed each 30 s window the previous window's text
+by default, so one hallucinated window repeats through the rest of a long file.
+Every sequential Whisper decode path (in-process faster-whisper, the isolated
+faster-whisper sidecar, MLX Whisper) must turn that off. Per-request options
+still pass through.
+"""
+import importlib.util
+import os
+import sys
+import types
+from types import SimpleNamespace
+
+os.environ.setdefault("OMNIVOICE_MODEL", "test")
+os.environ.setdefault("OMNIVOICE_DISABLE_FILE_LOG", "1")
+
+
+class _FakeModel:
+    def __init__(self):
+        self.kwargs = None
+
+    def transcribe(self, _audio, **kwargs):
+        self.kwargs = kwargs
+        seg = SimpleNamespace(start=0.0, end=1.0, text="hello", words=None)
+        return iter([seg]), SimpleNamespace(language="en", language_probability=1.0, duration=1.0)
+
+
+def test_faster_whisper_decodes_windows_independently(monkeypatch):
+    from services import asr_backend as ab
+
+    backend = ab.FasterWhisperBackend(model_name="small")
+    fake = _FakeModel()
+    backend._model = fake
+    monkeypatch.setattr(backend, "_ensure_model", lambda: None)
+    backend.transcribe("clip.wav", word_timestamps=False, language="de")
+    assert fake.kwargs["condition_on_previous_text"] is False
+    assert fake.kwargs["language"] == "de"
+
+
+def test_mlx_whisper_decodes_windows_independently(monkeypatch):
+    from services import asr_backend as ab
+
+    captured = {}
+    fake_mlx = types.ModuleType("mlx_whisper")
+
+    def _transcribe(audio, **kwargs):
+        captured.update(kwargs)
+        return {"text": "hallo", "segments": [], "language": "de"}
+
+    fake_mlx.transcribe = _transcribe
+    monkeypatch.setitem(sys.modules, "mlx_whisper", fake_mlx)
+    monkeypatch.setattr(ab, "_decode_audio_16k_mono", lambda _path: [0.0, 0.0, 0.0])
+    monkeypatch.setattr(ab, "_local_model_source", lambda name: name)
+
+    ab.MLXWhisperBackend().transcribe("clip.wav", word_timestamps=False)
+    assert captured["condition_on_previous_text"] is False
+
+
+def test_isolated_sidecar_decodes_windows_independently(monkeypatch):
+    path = os.path.join(
+        os.path.dirname(__file__), "..", "backend", "engines", "_asr_sidecar", "main.py"
+    )
+    spec = importlib.util.spec_from_file_location("_asr_sidecar_main_t", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    fake = _FakeModel()
+    monkeypatch.setattr(mod, "_get_model", lambda: fake)
+    out = mod._transcribe("clip.wav", False, {"beam_size": 2}, {"language": "fr"})
+    assert out["text"] == "hello"
+    assert fake.kwargs["condition_on_previous_text"] is False
+    assert fake.kwargs["beam_size"] == 2 and fake.kwargs["language"] == "fr"
+
+
+# ── Perf: CPU threads + CUDA batched decode with sequential fallback ─────────
+
+def _cuda_backend(monkeypatch, pipe, *, batched=True):
+    from services import asr_backend as ab
+
+    if batched:
+        monkeypatch.setenv("OMNIVOICE_ASR_BATCHED", "1")
+
+    backend = ab.FasterWhisperBackend(model_name="small")
+    seq = _FakeModel()
+    backend._model = seq
+    backend._device = "cuda"
+    backend._batched_pipe = pipe
+    backend._batched_for = seq
+    monkeypatch.setattr(backend, "_ensure_model", lambda: None)
+    return backend, seq
+
+
+def test_cuda_uses_batched_pipeline(monkeypatch):
+    pipe = _FakeModel()
+    backend, seq = _cuda_backend(monkeypatch, pipe)
+    backend.transcribe("clip.wav", word_timestamps=True)
+    assert pipe.kwargs["batch_size"] >= 8
+    assert pipe.kwargs["without_timestamps"] is False  # keep segment timestamps
+    assert pipe.kwargs["vad_filter"] is True and pipe.kwargs["word_timestamps"] is True
+    assert seq.kwargs is None
+
+
+def test_batched_failure_falls_back_to_sequential(monkeypatch):
+    class _Boom(_FakeModel):
+        def transcribe(self, *_a, **_k):
+            raise RuntimeError("batched exploded")
+
+    backend, seq = _cuda_backend(monkeypatch, _Boom())
+    out = backend.transcribe("clip.wav", word_timestamps=False)
+    assert out["segments"][0]["text"] == "hello"
+    assert seq.kwargs is not None and "batch_size" not in seq.kwargs
+    assert backend._batched is False  # not retried on every chunk
+
+
+def test_batched_is_opt_in_and_cuda_only(monkeypatch):
+    pipe = _FakeModel()
+    monkeypatch.delenv("OMNIVOICE_ASR_BATCHED", raising=False)
+    backend, seq = _cuda_backend(monkeypatch, pipe, batched=False)
+    backend.transcribe("clip.wav", word_timestamps=False)
+    assert pipe.kwargs is None and seq.kwargs is not None
+    backend2, seq2 = _cuda_backend(monkeypatch, pipe)
+    backend2._device = "cpu"
+    backend2.transcribe("clip.wav", word_timestamps=False)
+    assert pipe.kwargs is None and seq2.kwargs is not None
+
+
+def test_cpu_threads_capped():
+    from services import asr_backend as ab
+
+    kw = ab._whisper_thread_kwargs("cpu")
+    assert 1 <= kw["cpu_threads"] <= 8
+    assert ab._whisper_thread_kwargs("cuda") == {}
+
+
+def test_batched_decode_drops_no_speech_windows(monkeypatch):
+    noise = SimpleNamespace(start=0.0, end=1.0, text="noise", words=None,
+                            no_speech_prob=0.9, avg_logprob=-2.0)
+    speech = SimpleNamespace(start=1.0, end=2.0, text="speech", words=None,
+                             no_speech_prob=0.1, avg_logprob=-0.2)
+
+    class _Pipe(_FakeModel):
+        def transcribe(self, _audio, **kwargs):
+            return iter([noise, speech]), SimpleNamespace(
+                language="en", language_probability=1.0, duration=2.0)
+
+    backend, _seq = _cuda_backend(monkeypatch, _Pipe())
+    out = backend.transcribe("clip.wav", word_timestamps=False)
+    assert [s["text"] for s in out["segments"]] == ["speech"]
+
+
+def test_unload_releases_batched_references(monkeypatch):
+    import gc
+    import weakref
+
+    # Keep the real ROCm isolation package out of sys.modules (it would leak
+    # into later tests that swap that package).
+    fake = types.ModuleType("core.windows_rocm.asr_isolation")
+    fake.unload_isolated = lambda _backend: False
+    monkeypatch.setitem(sys.modules, "core.windows_rocm.asr_isolation", fake)
+    backend, seq = _cuda_backend(monkeypatch, _FakeModel())
+    ref = weakref.ref(seq)
+    del seq
+    backend._model = backend._batched_for  # the only remaining owners are the model slot + batch refs
+    backend.unload()
+    gc.collect()
+    assert backend._batched_pipe is None and backend._batched_for is None
+    assert ref() is None
+
+
+def test_batched_decodes_are_serialized(monkeypatch):
+    import threading
+
+    from services import asr_backend as ab
+
+    first_inside = threading.Event()
+    release_first = threading.Event()
+    second_waiting = threading.Event()
+    active = {"now": 0, "max": 0}
+    guard = threading.Lock()
+
+    class _SpyLock:
+        """Real lock that signals when someone tries to take it while held."""
+
+        def __init__(self):
+            self._lock = threading.Lock()
+
+        def __enter__(self):
+            if not self._lock.acquire(blocking=False):
+                second_waiting.set()
+                self._lock.acquire()
+            return self
+
+        def __exit__(self, *exc):
+            self._lock.release()
+
+    monkeypatch.setattr(ab, "_BATCHED_DECODE_LOCK", _SpyLock())
+
+    class _Pipe(_FakeModel):
+        def transcribe(self, _audio, **kwargs):
+            with guard:
+                active["now"] += 1
+                active["max"] = max(active["max"], active["now"])
+            if not first_inside.is_set():
+                first_inside.set()
+                assert release_first.wait(5)
+            with guard:
+                active["now"] -= 1
+            return super().transcribe(_audio, **kwargs)
+
+    backend, _seq = _cuda_backend(monkeypatch, _Pipe())
+    threads = [threading.Thread(target=backend.transcribe, args=("c.wav",),
+                                kwargs={"word_timestamps": False}) for _ in range(2)]
+    threads[0].start()
+    assert first_inside.wait(5)
+    threads[1].start()
+    assert second_waiting.wait(5)  # second call is blocked on the lock...
+    assert active["now"] == 1      # ...while the first is still decoding
+    release_first.set()
+    [t.join(5) for t in threads]
+    assert active["max"] == 1
+
+
+def test_batched_fallback_log_is_scrubbed(monkeypatch, caplog):
+    class _Boom(_FakeModel):
+        def transcribe(self, *_a, **_k):
+            raise FileNotFoundError("/Users/alice/Secret Project/clip.wav not found")
+
+    backend, _seq = _cuda_backend(monkeypatch, _Boom())
+    with caplog.at_level("WARNING"):
+        backend.transcribe("clip.wav", word_timestamps=False)
+    assert "alice" not in caplog.text
